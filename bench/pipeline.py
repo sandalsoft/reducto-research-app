@@ -52,18 +52,39 @@ def _parse(client: Reducto, file_id: str, k: int) -> dict:
             "blocks": len(blocks), "low_conf_blocks": sum(1 for b in blocks if b.get("confidence") == "low")}
 
 
-def extract(client: Reducto, parse_job_id: str) -> dict:
+def _extract_once(client: Reducto, source: str) -> dict:
     with timed() as t:
         ex = client.extract.run(
-            input=f"jobid://{parse_job_id}",  # reuse the parse: no re-upload, no re-OCR
+            input=source,
             instructions={"schema": EMAIL_SCHEMA, "system_prompt": EXTRACT_PROMPT},
-            settings={"citations": {"enabled": True}},
+            settings={"deep_extract": True,  # array of messages; agentic pass, 2× extract list price
+                      "citations": {"enabled": True, "numerical_confidence": True}},
         )
     result = plain(ex.result)
     if isinstance(result, list):
         result = result[0] if result else {}
     return {"extract_s": t.s, "extract_job_id": ex.job_id, "extract_pages": ex.usage.num_pages,
-            "fields": result}
+            "deep_extract": True, "extract_input": source, "fields": result}
+
+
+def extract(client: Reducto, parse_job_id: str | None = None, file_id: str | None = None) -> dict:
+    """Prefer the cached parse (`jobid://`). If that job is gone, Extract from `file_id` (re-parses)."""
+    sources = []
+    if parse_job_id:
+        sources.append(f"jobid://{parse_job_id}")
+    if file_id:
+        sources.append(file_id)
+    last = None
+    for src in sources:
+        try:
+            return _extract_once(client, src)
+        except Exception as exc:
+            last = exc
+            if getattr(exc, "status_code", None) != 404:
+                raise
+    if last:
+        raise last
+    raise ValueError("extract needs parse_job_id or file_id")
 
 
 def run_variant(client: Reducto, doc_id: str, variant: str, path: Path, k: int, do_extract: bool) -> dict:
@@ -85,7 +106,7 @@ def run_variant(client: Reducto, doc_id: str, variant: str, path: Path, k: int, 
         rec.update(_parse(client, up.file_id, k))
         if do_extract:
             stage = "extract"
-            rec.update(extract(client, rec["parse_job_id"]))
+            rec.update(extract(client, rec["parse_job_id"], rec.get("file_id")))
     except Exception as exc:  # noqa: BLE001 - benchmark must record, not crash
         rec["error"] = error_info(stage, exc)
     rec["t1"] = time.time()
@@ -96,7 +117,7 @@ def repeat_extract(client: Reducto, rec: dict) -> dict:
     """Determinism check: run the same extraction again on the same parse."""
     out = {"id": rec["id"], "variant": rec["variant"], "error": None}
     try:
-        out.update(extract(client, rec["parse_job_id"]))
+        out.update(extract(client, rec["parse_job_id"], rec.get("file_id")))
     except Exception as exc:  # noqa: BLE001
         out["error"] = error_info("extract", exc)
     return out

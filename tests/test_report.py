@@ -45,3 +45,41 @@ def test_build_report_end_to_end(tmp_path):
     assert "parse/APIError/500: 1" in report
     rows = list(csv.DictReader((out / "emails.csv").open()))
     assert [r["id"] for r in rows] == ["E1"] and rows[0]["core_matches_ground_truth"] == "False"
+    assert rows[0]["msg_index"] == "0" and rows[0]["n_messages"] == "1"
+    assert "Thread extraction" in report
+
+
+def _thread_fields():
+    w = lambda v: {"value": v, "citations": [{"confidence": "high",  # noqa: E731
+                                               "granular_confidence": {"extract_confidence": 0.95},
+                                               "bbox": {"left": 0.1, "top": 0.1, "width": 0.2, "height": 0.05,
+                                                        "page": 1}}]}
+    return {"messages": [
+        {"sender": w("Jane Roe"), "recipients_to": [w("John Doe")], "recipients_cc": [],
+         "sent_date": w("Monday, March 4, 2013 9:15 AM"), "subject": w("Lunch plans"), "body": w("See you.")},
+        {"sender": w("John Doe"), "recipients_to": [w("Jane Roe")], "recipients_cc": [],
+         "sent_date": w("Monday, March 4, 2013 10:00 AM"), "subject": w("Re: Lunch plans"), "body": w("OK.")},
+    ]}
+
+
+def test_build_report_thread_schema_explodes_csv(tmp_path):
+    out, notes, images = tmp_path / "output", tmp_path / "notes", tmp_path / "images"
+    out.mkdir()
+    notes.mkdir()
+    images.mkdir()
+    (notes / "friction_log.md").write_text("# Friction log\n- example")
+    thread = ("From: Jane Roe\nTo: John Doe\nSent: Monday, March 4, 2013 9:15 AM\nSubject: Lunch plans\n\nSee you.\n\n"
+              "From: John Doe\nTo: Jane Roe\nSent: Monday, March 4, 2013 10:00 AM\nSubject: Re: Lunch plans\n\nOK.")
+    hdr = {"sender": "Jane Roe", "recipients_to": "John Doe", "recipients_cc": None,
+           "sent_date": "Monday, March 4, 2013 9:15 AM", "subject": "Lunch plans"}
+    append_jsonl(out / "ground_truth.jsonl", [
+        {"id": "E1", "text": thread, "is_email": True, "headers": hdr, "pages_total": 1, "k_pages": 1}])
+    append_jsonl(out / "results.jsonl", [_run("E1", "image", "load", thread, _thread_fields())])
+    from PIL import Image
+    Image.new("RGB", (100, 80), (255, 255, 255)).save(images / "E1_page_1.jpg")
+    report = build(out, notes, images).read_text()
+    assert "gt messages" in report and "Deep Extract" in report
+    rows = list(csv.DictReader((out / "emails.csv").open()))
+    assert [r["msg_index"] for r in rows] == ["0", "1"]
+    assert rows[0]["matched_gt"] == "True" and rows[1]["matched_gt"] == "True"
+    assert (out / "overlays" / "E1" / "image_p1.jpg").exists()

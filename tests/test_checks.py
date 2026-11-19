@@ -22,6 +22,58 @@ def test_header_fields_first_same_line_value_wins():
     assert gt["recipients_cc"] is None
 
 
+THREAD = """From: Jane Roe
+To: John Doe
+Sent: Monday, March 4, 2013 9:15 AM
+Subject: Lunch plans
+
+Let's meet at noon.
+
+From: John Doe
+To: Jane Roe
+Sent: Monday, March 4, 2013 10:00 AM
+Subject: Re: Lunch plans
+
+Thursday works.
+"""
+
+
+def test_header_blocks_split_on_repeated_label():
+    blocks = checks.header_blocks(THREAD)
+    assert len(blocks) == 2
+    assert blocks[0]["sender"] == "Jane Roe" and blocks[0]["subject"] == "Lunch plans"
+    assert blocks[1]["sender"] == "John Doe" and blocks[1]["subject"] == "Re: Lunch plans"
+    assert checks.header_fields(THREAD)["sender"] == "Jane Roe"  # first-wins still true
+    assert checks.header_blocks(TEXT)[0]["subject"] == "Lunch plans"
+    both = checks.header_blocks("From: A\nSent: Monday\nDate: 4 Mar\nSubject: Hi")
+    assert len(both) == 1 and both[0]["sent_date"] == "Monday"
+
+
+def test_as_messages_accepts_legacy_and_thread_schema():
+    legacy = {"sender": "Jane Roe", "subject": "Lunch plans"}
+    assert checks.as_messages(legacy) == [legacy]
+    wrapped = {"messages": [{"sender": {"value": "A", "citations": []}},
+                            {"sender": {"value": "B", "citations": []}}]}
+    msgs = checks.as_messages(wrapped)
+    assert [checks.unwrap(m["sender"])[0] for m in msgs] == ["A", "B"]
+    assert checks.as_messages(None) == []
+
+
+def test_match_messages_greedy_core_alignment():
+    truths = checks.header_blocks(THREAD)
+    extracted = [
+        {"sender": "John Doe", "sent_date": "Monday, March 4, 2013 10:00 AM", "subject": "Re: Lunch plans"},
+        {"sender": "Jane Roe", "sent_date": "Monday, March 4, 2013 9:15 AM", "subject": "Lunch plans"},
+        {"sender": "Nobody", "sent_date": "Tuesday", "subject": "Unrelated"},
+    ]
+    m = checks.match_messages(extracted, truths)
+    paired = {(i, j) for i, j, _ in m["pairs"]}
+    assert paired == {(1, 0), (0, 1)}  # order in extract does not have to match GT
+    assert m["extras"] == [2] and m["misses"] == []
+    assert checks.message_core_correct(extracted[1], truths[0]) is True
+    assert checks.message_core_correct(extracted[2], truths[0]) is False
+
+
 def test_field_match_handles_lists_order_and_punctuation():
     assert checks.field_match(["Ann Smith", "John Doe"], "John Doe; Ann Smith")
     assert checks.field_match("Lunch plans.", "Lunch plans")

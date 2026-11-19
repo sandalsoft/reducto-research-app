@@ -13,7 +13,12 @@ NOTES_DIR = ROOT / "notes"
 
 # List prices in USD per page: https://docs.reducto.ai/reference/credit-usage.md (effective 2026-09-01).
 # The API's `usage.credits` is None on this account, so cost is derived from page counts.
-PRICE_PER_PAGE = {"classify": 7.50 / 1000, "parse": 10.0 / 1000, "extract": 20.0 / 1000}
+PRICE_PER_PAGE = {
+    "classify": 7.50 / 1000,
+    "parse": 10.0 / 1000,
+    "extract": 20.0 / 1000,
+    "deep_extract": 40.0 / 1000,  # agentic extract; 2× standard extract, parse included
+}
 
 CLASSIFY_SCHEMA = [
     {"category": "email", "criteria": [
@@ -26,25 +31,42 @@ CLASSIFY_SCHEMA = [
     {"category": "other", "criteria": ["Anything else: lists, notes, schedules, books, manuscripts"]},
 ]
 
+# Per-message fields. The extract schema is an array of these so a thread is N objects, not one
+# "top" email. That is the point of the exercise: schema shape is the accuracy lever.
+MESSAGE_PROPERTIES = {
+    "sender": {"type": "string",
+               "description": "From: name and/or address of this message, exactly as printed"},
+    "recipients_to": {"type": "array", "items": {"type": "string"},
+                      "description": "Every To: recipient of this message, exactly as printed"},
+    "recipients_cc": {"type": "array", "items": {"type": "string"},
+                      "description": "Every Cc: recipient of this message, exactly as printed"},
+    "sent_date": {"type": "string",
+                  "description": "Sent/Date header value of this message, exactly as printed"},
+    "subject": {"type": "string",
+                "description": "Subject line of this message, exactly as printed"},
+    "body": {"type": "string",
+             "description": "Body of this message only, verbatim, excluding headers, signatures of other messages, and quoted forwards"},
+}
 EMAIL_SCHEMA = {
     "type": "object",
     "properties": {
-        "sender": {"type": "string", "description": "The From: name and/or address of the first (top) message, exactly as printed"},
-        "recipients_to": {"type": "array", "items": {"type": "string"},
-                          "description": "Every To: recipient of the first (top) message, exactly as printed"},
-        "recipients_cc": {"type": "array", "items": {"type": "string"},
-                          "description": "Every Cc: recipient of the first (top) message, exactly as printed"},
-        "sent_date": {"type": "string", "description": "The Sent/Date header value of the first (top) message, exactly as printed"},
-        "subject": {"type": "string", "description": "The Subject line of the first (top) message, exactly as printed"},
-        "body": {"type": "string",
-                 "description": "Full body text of the first (top) message, verbatim, excluding headers and footers"},
+        "messages": {
+            "type": "array",
+            "description": ("Every distinct email in reading order, outermost first. "
+                            "One item per From/Sent/Subject header block; do not merge replies or forwards."),
+            "items": {"type": "object", "properties": MESSAGE_PROPERTIES},
+        }
     },
 }
-FIELDS = tuple(EMAIL_SCHEMA["properties"])
+FIELDS = tuple(MESSAGE_PROPERTIES)  # scored per message, not on the envelope
 CORE_FIELDS = ("sender", "sent_date", "subject")  # must be right for a record to be usable
 HEADER_FIELDS = ("sender", "recipients_to", "recipients_cc", "sent_date", "subject")  # scorable vs ground truth
-EXTRACT_PROMPT = ("These pages are an email or email thread. Describe the first (top) message. "
-                  "Copy values exactly as printed; leave a field empty if it is not present.")
+EXTRACT_PROMPT = (
+    "These pages are an email or email thread. Extract every distinct message as its own array item, "
+    "outermost first. A message is one header block (From/To/Sent/Subject) plus the body that belongs "
+    "to it. Copy values exactly as printed; leave a field empty if it is not present. "
+    "Do not fold a forwarded or replied-to message into the outer one."
+)
 
 
 def load_env() -> None:

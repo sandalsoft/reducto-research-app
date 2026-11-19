@@ -37,6 +37,25 @@ def header_fields(text: str) -> dict:
     return out
 
 
+def header_blocks(text: str) -> list[dict]:
+    """Every header cluster in reading order. A repeated *label* (From, To, …) starts a new
+    message. Sent and Date both map to sent_date and may coexist in one block.
+    Same-line values only, same as header_fields; two-column tables still fool this."""
+    blocks, current, seen = [], dict.fromkeys(_LABEL_TO_FIELD.values()), set()
+    for m in _HEADER_LINE.finditer(text or ""):
+        label = m.group(1).lower()
+        field, value = _LABEL_TO_FIELD[label], m.group(2).strip() or None
+        if label in seen:
+            blocks.append(current)
+            current, seen = dict.fromkeys(_LABEL_TO_FIELD.values()), set()
+        seen.add(label)
+        if value and current[field] is None:
+            current[field] = value
+    if seen:
+        blocks.append(current)
+    return blocks
+
+
 def clean(text: str) -> str:
     """Symmetric normalization applied to both OCR output and reference: drop markdown/HTML
     markup that Parse adds, collapse whitespace. Case and punctuation are kept."""
@@ -121,6 +140,77 @@ def unwrap(field):
     return field, []
 
 
+def as_messages(fields) -> list[dict]:
+    """Normalize extract output to a list of per-message dicts.
+    New schema: `{messages: [...]}`. Legacy: a single flat message object."""
+    if not fields or not isinstance(fields, dict):
+        return []
+    if "messages" in fields:
+        raw, _ = unwrap(fields["messages"])
+        if isinstance(raw, list):
+            return [m for m in raw if isinstance(m, dict)]
+        return [raw] if isinstance(raw, dict) else []
+    return [fields]
+
+
+def citations(field) -> list[dict]:
+    """Raw citation dicts on a wrapped field or a list of wrapped items."""
+    if isinstance(field, dict) and "citations" in field:
+        return [c for c in (field.get("citations") or []) if isinstance(c, dict)]
+    if isinstance(field, list):
+        return [c for item in field for c in citations(item)]
+    return []
+
+
+def _plain(msg: dict, name: str):
+    v = (msg or {}).get(name)
+    if isinstance(v, str):
+        return v
+    return unwrap(v)[0]
+
+
+def pair_score(extracted: dict, truth: dict) -> float:
+    """0..1 similarity of core fields. Missing extract against a scorable GT field scores 0."""
+    scores = []
+    for name in CORE_FIELDS:
+        tv = _plain(truth, name)
+        if is_empty(tv):
+            continue
+        ev = _plain(extracted, name)
+        scores.append(0.0 if is_empty(ev) else fuzz.token_sort_ratio(norm(_as_text(ev)), norm(_as_text(tv))) / 100.0)
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def match_messages(extracted: list, truths: list, min_score: float = 0.5) -> dict:
+    """Greedy 1-1 assignment on pair_score. extras = unmatched extracts, misses = unmatched GT."""
+    ranked = sorted(((pair_score(extracted[i], truths[j]), i, j)
+                     for i in range(len(extracted)) for j in range(len(truths))), reverse=True)
+    used_e, used_t, pairs = set(), set(), []
+    for score, i, j in ranked:
+        if score < min_score or i in used_e or j in used_t:
+            continue
+        pairs.append((i, j, score))
+        used_e.add(i)
+        used_t.add(j)
+    return {"pairs": pairs,
+            "extras": [i for i in range(len(extracted)) if i not in used_e],
+            "misses": [j for j in range(len(truths)) if j not in used_t]}
+
+
+def message_core_correct(extracted: dict, truth: dict) -> bool | None:
+    scorable = [f for f in CORE_FIELDS if not is_empty(_plain(truth, f))]
+    if not scorable:
+        return None
+    return all(field_match(extracted.get(f), _plain(truth, f)) for f in scorable)
+
+
+def gt_blocks(gt: dict) -> list[dict]:
+    """Prefer stored header_blocks; else parse the text layer."""
+    if gt.get("header_blocks"):
+        return gt["header_blocks"]
+    return header_blocks(gt.get("text") or "")
+
+
 def is_empty(v) -> bool:
     if v is None:
         return True
@@ -161,9 +251,19 @@ def valid_date(s) -> bool:
 
 
 def field_report(fields: dict, text: str) -> dict:
+    """Per-field fill/grounding/confidence for one message (first message if given a thread)."""
+    msgs = as_messages(fields)
+    return _field_report_one(msgs[0] if msgs else fields or {}, text)
+
+
+def field_reports(fields: dict, text: str) -> list[dict]:
+    return [_field_report_one(m, text) for m in as_messages(fields)]
+
+
+def _field_report_one(msg: dict, text: str) -> dict:
     out = {}
     for name in FIELDS:
-        v, confs = unwrap((fields or {}).get(name))
+        v, confs = unwrap((msg or {}).get(name))
         filled = not is_empty(v)
         items = v if isinstance(v, list) else [v]
         out[name] = {"filled": filled,
@@ -174,12 +274,20 @@ def field_report(fields: dict, text: str) -> dict:
 
 def auto_accept(report: dict, fields: dict, min_conf: float) -> bool:
     """Straight-through-processing rule: core fields filled, grounded in the parse, confident,
-    and the date parses. No reported confidence counts as not confident (conservative)."""
+    and the date parses. No reported confidence counts as not confident (conservative).
+    `fields` may be a thread envelope or a single message."""
+    msgs = as_messages(fields)
+    msg = msgs[0] if msgs else (fields or {})
     for name in CORE_FIELDS:
         r = report[name]
         if not (r["filled"] and r["grounded"]) or r["min_conf"] is None or r["min_conf"] < min_conf:
             return False
-    return valid_date(unwrap((fields or {}).get("sent_date"))[0])
+    return valid_date(unwrap(msg.get("sent_date"))[0])
+
+
+def auto_accept_messages(fields: dict, text: str, min_conf: float) -> list[bool]:
+    """Per-message STP on a thread."""
+    return [auto_accept(_field_report_one(m, text), m, min_conf) for m in as_messages(fields)]
 
 
 def _canon(v):
@@ -189,6 +297,17 @@ def _canon(v):
     return "" if is_empty(v) else norm(v)
 
 
+def _message_agreement(a: dict, b: dict) -> float:
+    return sum(_canon(a.get(f)) == _canon(b.get(f)) for f in FIELDS) / len(FIELDS)
+
+
 def agreement(a: dict, b: dict) -> float:
-    """Fraction of fields identical between two extractions (repeat run, or digital vs image)."""
-    return sum(_canon((a or {}).get(f)) == _canon((b or {}).get(f)) for f in FIELDS) / len(FIELDS)
+    """Fraction of fields identical between two extractions (repeat run, or digital vs image).
+    Threads are matched greedily; extras and misses count as 0."""
+    ma, mb = as_messages(a), as_messages(b)
+    if not ma and not mb:
+        return 1.0
+    matched = match_messages(ma, mb, min_score=0.0)
+    scores = [_message_agreement(ma[i], mb[j]) for i, j, _ in matched["pairs"]]
+    n = len(scores) + len(matched["extras"]) + len(matched["misses"])
+    return (sum(scores) / n) if n else 0.0
